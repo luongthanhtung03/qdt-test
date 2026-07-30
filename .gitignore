@@ -1,0 +1,18 @@
+# Build output
+/server
+/bin/
+*.exe
+*.exe~
+
+# Local configuration
+.env
+
+# SQLite database files (including WAL sidecars)
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# Test and scratch output
+*.out
+/tmp/

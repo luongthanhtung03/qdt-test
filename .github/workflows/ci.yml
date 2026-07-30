@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      # The race detector needs cgo and a C compiler, which the development
+      # machine for this project does not have. The runner does, so this is
+      # where the concurrency tests get race-verified for real.
+      - name: Test (race)
+        env:
+          CGO_ENABLED: "1"
+        run: go test ./... -race -count=1
+
+      # Also prove the pure-Go build path works: modernc.org/sqlite means the
+      # whole suite runs with no C toolchain at all.
+      - name: Test (CGO_ENABLED=0)
+        env:
+          CGO_ENABLED: "0"
+        run: go test ./... -count=1

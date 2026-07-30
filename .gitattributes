@@ -1,0 +1,8 @@
+# Keep the repository LF-canonical regardless of the checkout platform.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.db binary
