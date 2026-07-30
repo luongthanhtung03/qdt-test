@@ -1,10 +1,51 @@
 # Content Management Service
 
 A content management backend in Go and SQLite: versioned content with optimistic locking,
-scheduled publishing that survives restarts and never double-publishes, a public read API that
-cannot serve unpublished content, and the SEO surface a backend actually owns.
+scheduled publishing that survives restarts and never double-publishes, a public API that cannot
+serve unpublished content, and server-rendered pages built for search engines.
 
-`docs/DESIGN.md` covers why it is built this way. This file covers how to run it.
+This README is self-contained: how to run it, the technical decisions, the assumptions made, and
+what is deliberately missing. `docs/DESIGN.md` is optional further reading — the schema
+rationale, the failure modes the design targets, and the SQL-level flows.
+
+---
+
+## Where everything is
+
+Mapping each item in the brief to the code that satisfies it.
+
+**Required features**
+
+| Requirement | Implementation | Verified by |
+|---|---|---|
+| Create and edit content | `POST` / `PUT /api/v1/contents` | `internal/httpapi/admin.go` |
+| Record change history | `GET /api/v1/contents/{id}/versions` — versions are append-only | `TestVersionHistory` |
+| Concurrent edits must not silently overwrite | `If-Match` required → `412` on conflict, `428` if omitted | `TestConcurrentUpdate_OnlyOneWins` |
+| Publish a version | `POST /api/v1/contents/{id}/publish` | `TestPublishOlderVersion` |
+| Schedule a future publish | `POST /api/v1/contents/{id}/schedules` | `TestScheduledPublish_HappyPath` |
+| Cancel a schedule | `DELETE /api/v1/schedules/{id}` | `TestCancelSchedule` |
+| Public API returns only published content | `/public/v1/*` and `GET /{slug}` | `TestPublicNeverLeaksUnpublished` |
+
+**The five stated assumptions**
+
+| Assumption | How it is handled | Test |
+|---|---|---|
+| Many concurrent requests | Compare-and-swap on `current_version`; unique indexes resolve create/schedule races | `TestConcurrentUpdate_OnlyOneWins`, `TestConcurrentCreateSameSlug` |
+| Multiple application instances | Leased claim protocol; atomic `UPDATE` on a single-writer pool | `TestScheduledPublish_ExactlyOnce_MultiWorker` (5 workers, 1 job, 1 event) |
+| Process may stop or restart at any time | Schedules live in a table, not a timer; graceful shutdown releases claims | `TestGracefulShutdownReleasesClaims` |
+| Scheduled publishing still works after restart | Worker reclaims on the next poll; expired leases are stealable | `TestScheduledPublish_SurvivesRestart`, `TestLeaseRecoveryAfterCrash` |
+| Unpublished content must never reach the public API | Public reads join through `published_version_id`; there is no status filter to forget | `TestPublicNeverLeaksUnpublished`, `TestHTMLPage_NeverLeaksUnpublished` |
+
+**Deliverables**
+
+| Asked for | Where |
+|---|---|
+| Source code | this repository |
+| Database migration | `migrations/00001_init.sql`, embedded and applied on boot |
+| How to run the project | [Quick start](#quick-start) below |
+| Automated tests for high-risk scenarios | [Testing](#testing) — the table of ten and why each one matters |
+| Assumptions, decisions, unfinished work, limitations | [Assumptions](#assumptions) · [Technical decisions](#technical-decisions) · [Not implemented](#not-implemented) · [Known limitations](#known-limitations) |
+| *Bonus:* good for SEO | [SEO](#seo) — rendered pages, sitemap, robots, conditional caching |
 
 ---
 
@@ -67,8 +108,18 @@ discipline: unpublished content is unreachable publicly, and a stale write is de
 
 ### Public — no authentication
 
-`GET /public/v1/contents` · `GET /public/v1/contents/{slug}` · `GET /sitemap.xml` ·
-`GET /robots.txt` · `GET /healthz`
+| Method | Path | Returns |
+|---|---|---|
+| `GET` | `/{slug}` | **Rendered HTML page** — the canonical URL, what crawlers index |
+| `GET` | `/public/v1/contents` | JSON list of published content |
+| `GET` | `/public/v1/contents/{slug}` | JSON for one published document |
+| `GET` | `/sitemap.xml` | Published, indexable pages |
+| `GET` | `/robots.txt` | Crawler directives + sitemap pointer |
+| `GET` | `/healthz` | Liveness, including a database write-pool ping |
+
+All three content routes go through the same store query, so they share one guarantee: a draft
+has no row to return. `/{slug}` is registered last as a wildcard; chi matches static segments
+first, so it cannot shadow any route above it (`TestHTMLPage_DoesNotShadowOtherRoutes`).
 
 ### Errors
 
@@ -165,6 +216,30 @@ curl "$B/api/v1/contents/$ID" -H "$A" | grep -o '"status":"[^"]*"'
 # "status":"published_with_draft"
 ```
 
+**The rendered page**, which is what a crawler sees at the canonical URL:
+
+```bash
+curl "$B/lifecycle"
+```
+```html
+<title>SQLite Concurrency, Explained</title>
+<meta name="description" content="Why SQLite permits one writer, and how WAL mode keeps readers going.">
+<link rel="canonical" href="http://localhost:8080/how-sqlite-handles-concurrency">
+<meta property="og:type" content="article">
+<meta property="og:title" content="SQLite Concurrency, Explained">
+<meta property="og:image" content="http://localhost:8080/img/cover.png">
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"Article",
+  "headline":"SQLite Concurrency, Explained","datePublished":"2026-07-30T17:01:36.774Z", ...}</script>
+...
+<h1>How SQLite Handles Concurrency</h1>
+<div class="body">SQLite allows exactly one writer at a time.
+
+WAL mode lets readers run alongside that writer.</div>
+```
+
+Note `<title>` and `<h1>` differ — `meta_title` drives the search result, the content title
+drives the page. The body text is in the markup, so no JavaScript is needed to index it.
+
 **Sitemap and conditional requests.**
 
 ```bash
@@ -174,11 +249,14 @@ curl "$B/sitemap.xml"
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
-    <loc>http://localhost:8080/public/v1/contents/lifecycle</loc>
+    <loc>http://localhost:8080/lifecycle</loc>
     <lastmod>2026-07-30T15:45:45Z</lastmod>
   </url>
 </urlset>
 ```
+
+Every `<loc>` resolves to a rendered page, not a JSON endpoint — a sitemap listing URLs that
+return `application/json` advertises pages no crawler can index.
 ```bash
 ETAG=$(curl -sI "$B/public/v1/contents/lifecycle" | grep -i '^etag:' | tr -d '\r' | cut -d' ' -f2)
 curl -o /dev/null -w '%{http_code}\n' -H "If-None-Match: $ETAG" "$B/public/v1/contents/lifecycle"  # 304
@@ -211,7 +289,46 @@ timer, so the process holding it is irrelevant.
 
 ---
 
-## Design decisions worth knowing about
+## Assumptions
+
+Things taken as given. Where an assumption is wrong for your deployment, the note says what
+breaks.
+
+**About the environment**
+
+- **One host.** SQLite is a file, so every process sharing this database shares a filesystem.
+  Multiple *processes* on one machine are fully supported and tested; multiple *machines* are
+  not, and WAL over NFS is explicitly unsafe. See [SQLite and multiple instances](#sqlite-and-multiple-instances--the-honest-version).
+- **Each instance trusts its own clock.** No skew correction. With a one-second poll a publish
+  lands within about a second of `run_at`; two instances whose clocks differ by more than that
+  will disagree on which jobs are due. Harmless here because claiming is atomic, but it is why
+  timing is "within about a second" rather than exact.
+- **The process may be killed without warning.** Nothing is held only in memory. A schedule is a
+  row, and a half-finished job is recovered from an expired lease rather than from any in-process
+  state.
+
+**About the callers**
+
+- **Admin callers are trusted.** One shared bearer token, per the brief. There are no users or
+  roles, so `created_by` records an optional `X-Actor` header rather than a verified identity —
+  useful as an audit hint, not as evidence.
+- **Content bodies are plain text, not markup.** The rendered page escapes them and preserves
+  newlines. If you want Markdown or rich text, that conversion belongs in a layer above this one;
+  rendering author-supplied HTML would be a stored-XSS vector
+  (`TestHTMLPage_EscapesContent` pins the current behaviour).
+- **Slugs are supplied, not generated.** They are validated (lowercase, alphanumeric, single
+  hyphens) rather than sanitised, because silently rewriting a caller's slug would make the
+  public URL unpredictable.
+
+**About the data**
+
+- **Version numbers are per-document**, starting at 1, and never reused.
+- **Content volume is modest.** Limit/offset pagination and a single-file sitemap are fine for
+  thousands of documents. Past ~50,000 published pages the sitemap needs splitting into an index.
+
+---
+
+## Technical decisions
 
 ### SQLite and multiple instances — the honest version
 
@@ -275,6 +392,33 @@ Never both, never neither. Cancellation is best-effort once `run_at` passes, but
 never told the cancel succeeded when it did not. `TestCancelRacesDueTime` runs this race thirty
 times and asserts the invariant on every one.
 
+### SEO
+
+The brief asks for a *website* that is good for SEO, so the content is served as crawlable HTML
+at its canonical URL — not only as JSON.
+
+`GET /{slug}` renders a page server-side with `html/template`:
+
+- `<title>` from `meta_title`, falling back to the content title. The on-page `<h1>` keeps the
+  **content** title, because the two differing is the entire reason `meta_title` exists.
+- `<meta name="description">`, `<link rel="canonical">`, Open Graph and Twitter Card tags.
+- **JSON-LD `Article`** — `headline`, `description`, `datePublished`, `dateModified`, `image`.
+- `<meta name="robots" content="noindex, nofollow">` when the version sets `noindex`.
+- The article text is **in the markup**, so a crawler needs no JavaScript.
+
+Around it, the parts of SEO a backend genuinely owns:
+
+| | |
+|---|---|
+| **Discovery** | `/sitemap.xml` from published content, `<lastmod>` from `published_at`. `noindex` pages are excluded — advertising a page you told crawlers to ignore is a contradictory signal that search consoles report as an error. |
+| **Crawl budget** | `ETag` + `Last-Modified` on every public response, `304` on `If-None-Match`, `Cache-Control: public, max-age=60, stale-while-revalidate=300`. A crawler re-fetching an unchanged page costs almost nothing. |
+| **Correct status codes** | Unpublished and unknown slugs both return a real `404`, not a `200` with an error body. A soft 404 is treated as a quality problem. |
+| **Metadata versioning** | SEO fields live on the version, not the document, so rolling back to an older version rolls back its metadata too (`TestSEOMetadataIsPerVersion`). |
+| **Syndication** | An author-supplied `canonical_url` overrides the generated one. |
+
+What is deliberately *not* here: styling beyond a minimal readable stylesheet, images, and any
+client-side behaviour. The page exists to be correct and crawlable, not to be a design.
+
 ### Clock skew and timing
 
 Every instance reads its own system clock, and no skew correction is attempted. With a
@@ -290,8 +434,8 @@ lexicographic ordering that `WHERE run_at <= ?` depends on. Integers avoid the w
 ## Testing
 
 ```bash
-go test ./...            # 47 tests plus subtests, about 15 seconds
-make cover               # 77.3% across internal packages
+go test ./...            # 55 tests plus subtests, about 18 seconds
+make cover               # 81.8% across internal packages
 ```
 
 The suite runs against **real SQLite** in a temp directory, not a mock. The failure modes this
@@ -310,6 +454,7 @@ Ten scenarios from `docs/DESIGN.md` §9 carry most of the weight:
 | `TestCancelRacesDueTime` | 30 rounds; every one resolves to cancelled-or-published, never both |
 | `TestPublishOlderVersion` | Publishing v1 while v3 is the draft serves v1 |
 | `TestConcurrentCreateSameSlug` | 15 concurrent creates → one `201`, fourteen `409` |
+| `TestHTMLPage_NeverLeaksUnpublished` | The rendered page is a second surface a draft could escape through, so it is asserted separately |
 | `TestMigrations_UpDownUp` | Migrations are reversible and re-runnable |
 | `TestPublicETagReturns304` | Conditional requests work, and the tag changes when content does |
 
@@ -364,15 +509,42 @@ No ORM and no code generation. All SQL is hand-written.
 
 ## Not implemented
 
-Called out deliberately rather than left to be discovered:
+Called out deliberately rather than left to be discovered.
 
 - **Real authentication and authorization.** A single static bearer token, which the brief
-  waives. There are no users, roles, or per-document permissions, and `created_by` is populated
-  from an optional `X-Actor` header rather than a verified identity.
-- **Soft delete.** There is no delete endpoint at all.
-- Media and asset handling, full-text search, webhooks, rate limiting.
-- `Idempotency-Key` on publish. The operation is already idempotent by version, so this would
+  waives. There are no users, roles, or per-document permissions, and `created_by` comes from an
+  optional `X-Actor` header rather than a verified identity.
+- **Delete, hard or soft.** There is no delete endpoint. Unpublishing withdraws content from the
+  public API but keeps every version.
+- **Media and asset handling.** `og_image_url` stores a URL; nothing is uploaded or served.
+- **Full-text search, webhooks, rate limiting.**
+- **`Idempotency-Key` on publish.** The operation is already idempotent by version, so this would
   only guard against duplicate *requests*, not duplicate effects.
-- Cursor pagination. Limit/offset is adequate at this scale and is honest about being so.
-- Server-rendered HTML. The SEO work here is metadata, sitemap, robots, and conditional caching —
-  the parts a backend owns. Rendered markup belongs to whatever consumes this API.
+- **Cursor pagination.** Limit/offset is adequate at this scale and honest about being so.
+- **A sitemap index.** One sitemap file, capped at 50,000 URLs — the protocol limit before an
+  index is required.
+
+---
+
+## Known limitations
+
+Things that *are* implemented, but whose edges are worth knowing.
+
+- **One host only.** The claim protocol is correct for many processes sharing one file, and
+  tested that way. It is not correct across machines, because SQLite is not a network database.
+  The protocol itself ports to Postgres unchanged — swap the driver, add
+  `FOR UPDATE SKIP LOCKED`.
+- **Scheduled publishing is accurate to roughly the poll interval**, not to the millisecond, and
+  the tail is bounded by `SCHEDULER_LEASE_TTL` if a worker dies mid-job.
+- **Cancellation is best-effort once `run_at` passes.** The outcome is never ambiguous — see
+  [the cancel-versus-claim race](#the-cancel-versus-claim-race) — but a caller racing the
+  deadline may legitimately receive `409` and find the content published.
+- **A failed job retries indefinitely.** `attempts` is recorded and `last_error` is stored, but
+  there is no backoff and nothing moves a permanently failing job to `failed`. In practice the
+  only realistic failure is the database being unavailable, which fails everything anyway.
+- **Write throughput is one transaction at a time**, by design. Correct for a CMS, where reads
+  vastly outnumber writes; wrong for a write-heavy workload, which would want Postgres.
+- **The rendered page is minimal.** Correct and crawlable, with no theming, images, navigation,
+  or pagination — see [SEO](#seo) for exactly what it does and does not do.
+- **No observability beyond structured logs.** No metrics, no tracing, no per-endpoint timing
+  beyond the duration on each request log line.

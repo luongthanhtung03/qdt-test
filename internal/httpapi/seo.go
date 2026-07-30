@@ -86,8 +86,10 @@ func (s *Server) handleSitemap(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRobots(w http.ResponseWriter, r *http.Request) {
 	var b strings.Builder
 	b.WriteString("User-agent: *\n")
-	b.WriteString("Allow: /public/\n")
+	// Content pages live at the root and are the point of the site, so the
+	// default allow stands. Only the machine-facing surfaces are excluded.
 	b.WriteString("Disallow: /api/\n")
+	b.WriteString("Disallow: /public/\n") // the JSON API; the HTML pages are the indexable form
 	b.WriteString("Disallow: /healthz\n")
 	b.WriteString("\n")
 	b.WriteString("Sitemap: " + s.Cfg.PublicBaseURL + "/sitemap.xml\n")
@@ -100,8 +102,10 @@ func (s *Server) handleRobots(w http.ResponseWriter, r *http.Request) {
 
 // publicURL builds the canonical absolute URL for a slug.
 //
-// Sitemap entries must be absolute and must match the URL the content is
-// actually served from, or crawlers treat them as a different page.
+// This points at the server-rendered HTML page, not the JSON endpoint. A
+// sitemap whose entries return application/json advertises URLs a crawler
+// cannot index, and the loc must match the URL the page is actually served
+// from or crawlers treat it as a different page.
 func (s *Server) publicURL(slug string) string {
-	return s.Cfg.PublicBaseURL + "/public/v1/contents/" + slug
+	return s.Cfg.PublicBaseURL + "/" + slug
 }

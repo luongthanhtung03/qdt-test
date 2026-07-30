@@ -58,8 +58,8 @@ func TestSitemap(t *testing.T) {
 	require.Contains(t, resp.Header.Get("Content-Type"), "application/xml")
 
 	require.Len(t, doc.URLs, 1, "only indexable published content belongs in the sitemap")
-	require.Equal(t, "https://cms.example.com/public/v1/contents/published-page", doc.URLs[0].Loc,
-		"sitemap URLs must be absolute and match where the content is actually served")
+	require.Equal(t, "https://cms.example.com/published-page", doc.URLs[0].Loc,
+		"sitemap URLs must be absolute and point at the rendered HTML page, not the JSON API")
 	require.NotEmpty(t, doc.URLs[0].LastMod)
 
 	// lastmod must parse as a W3C datetime, or crawlers ignore it.

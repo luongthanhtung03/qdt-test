@@ -84,6 +84,11 @@ func (s *Server) Routes() http.Handler {
 	r.Get("/sitemap.xml", s.handleSitemap)
 	r.Get("/robots.txt", s.handleRobots)
 
+	// The canonical public page for a document, and what the sitemap points at.
+	// Registered last and at the root: chi matches static segments before
+	// wildcards, so every route above still wins over this one.
+	r.Get("/{slug}", s.handleHTMLPage)
+
 	return r
 }
 

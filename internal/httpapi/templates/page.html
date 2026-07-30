@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>{{ .Title }}</title>
+{{- with .Description }}
+<meta name="description" content="{{ . }}">
+{{- end }}
+{{- if .NoIndex }}
+<meta name="robots" content="noindex, nofollow">
+{{- end }}
+<link rel="canonical" href="{{ .CanonicalURL }}">
+
+<meta property="og:type" content="article">
+<meta property="og:title" content="{{ .Title }}">
+{{- with .Description }}
+<meta property="og:description" content="{{ . }}">
+{{- end }}
+<meta property="og:url" content="{{ .CanonicalURL }}">
+{{- with .OGImage }}
+<meta property="og:image" content="{{ . }}">
+{{- end }}
+<meta property="article:published_time" content="{{ .PublishedAt }}">
+<meta property="article:modified_time" content="{{ .UpdatedAt }}">
+
+<meta name="twitter:card" content="{{ if .OGImage }}summary_large_image{{ else }}summary{{ end }}">
+<meta name="twitter:title" content="{{ .Title }}">
+{{- with .Description }}
+<meta name="twitter:description" content="{{ . }}">
+{{- end }}
+
+<script type="application/ld+json">{{ .JSONLD }}</script>
+
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    max-width: 42rem;
+    margin: 0 auto;
+    padding: 2rem 1.25rem 4rem;
+    font: 1rem/1.65 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  h1 { font-size: 1.9rem; line-height: 1.2; margin: 0 0 .5rem; }
+  .meta { font-size: .875rem; opacity: .7; margin: 0 0 2rem; }
+  .body { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<article>
+  <!-- The on-page heading is the content title, deliberately not .Title:
+       .Title carries meta_title, which exists so the search result can read
+       differently from the page itself. -->
+  <h1>{{ .Heading }}</h1>
+  <p class="meta">
+    <time datetime="{{ .PublishedAt }}">Published {{ .PublishedAtHuman }}</time>
+  </p>
+  <div class="body">{{ .Body }}</div>
+</article>
+</body>
+</html>

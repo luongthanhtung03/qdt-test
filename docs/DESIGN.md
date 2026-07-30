@@ -1,8 +1,13 @@
 # Design Notes — Content Management Service (Go + SQLite)
 
-This document records the reasoning behind the implementation: what was decided, what was
-deliberately left out, and which failure modes the design is built to survive. The `README.md`
-covers how to run it; this covers why it looks the way it does.
+Supplementary reading. **`README.md` is the primary document** — it covers how to run the
+service, the assumptions, the technical decisions, what is unfinished, and the known limitations,
+and it stands alone.
+
+This file goes a level deeper on the parts a reader might want to interrogate: why the data model
+is shaped the way it is, what the schema guarantees and how, and the SQL behind the concurrency
+claims. Nothing here is required to evaluate the project; it is here because "why is the write
+pool capped at one connection?" deserves a longer answer than a README should carry.
 
 ---
 
@@ -10,10 +15,11 @@ covers how to run it; this covers why it looks the way it does.
 
 | Area | Decision |
 |---|---|
-| Scope | **Reliability-first.** All core features, depth in the risky parts, a strong concurrency test suite. SEO = metadata + sitemap + robots + ETag/304. No server-rendered HTML. |
+| Scope | **Reliability-first.** All core features, depth in the risky parts, a strong concurrency test suite. |
 | Scheduling | **DB polling worker with lease.** Not materialize-on-read. |
 | Dependencies | chi v5, goose v3, `modernc.org/sqlite`, testify, google/uuid, stdlib `log/slog`. Handwritten SQL, no ORM, no codegen. |
 | Concurrency API | **`If-Match` / `ETag`.** Stale → `412`, missing → `428`. |
+| SEO | **Server-rendered page per document** at its canonical slug, plus sitemap, robots and conditional caching. Metadata is stored per version. |
 
 chi and goose each *subtract* roughly fifty lines of chore code — subtree-scoped middleware and
 migration tracking respectively — rather than hiding anything behind abstraction. All the code
@@ -179,17 +185,21 @@ a panic.
 ## 5. Package layout
 
 ```
-cmd/server/main.go            wiring, migrate-on-boot, graceful shutdown
-internal/config/              env parsing
-internal/clock/               Clock interface + Fake (test time travel)
-internal/store/               db.go, tx helper, contents.go, schedules.go, events.go
-internal/content/             domain service: Create, Update, Publish, Unpublish, Schedule, Cancel
-internal/scheduler/           worker: claim loop, lease, graceful release
-internal/httpapi/             router.go, middleware.go, errors.go, admin.go, public.go, seo.go
-migrations/*.sql
+cmd/server/main.go       wiring, migrate-on-boot, graceful shutdown
+internal/config/         env parsing, fail-fast validation
+internal/clock/          Clock interface + Fake (test time travel)
+internal/store/          SQL only. db.go, tx.go, contents.go, schedules.go, publish.go, public.go
+internal/content/        domain service: validation, Create/Update/Publish/Schedule/Cancel
+internal/scheduler/      worker: claim loop, lease, graceful release
+internal/httpapi/        router, middleware, errors, admin.go, public.go, seo.go, html.go
+internal/httpapi/templates/  the rendered page
+internal/testutil/       shared harness: temp database, fake clock, httptest server
+migrations/              *.sql, embedded via embed.FS
 ```
 
-Interfaces exist only at the service boundary. No speculative abstraction.
+Dependencies point one way: `httpapi → content → store → SQLite`. `store` knows nothing about
+HTTP, and `httpapi` writes no SQL of its own. Interfaces exist only at the service boundary
+(`clock.Clock` is the main one) — no speculative abstraction.
 
 ---
 
@@ -253,49 +263,24 @@ Delivery is at-least-once; the effect is idempotent (same pointer, same value) a
 
 ---
 
-## 7. API surface
+## 7. Route isolation
 
-Admin, authenticated with `Authorization: Bearer $ADMIN_API_TOKEN`:
+The full endpoint list is in the README. One structural point belongs here, though, because it is
+a design decision rather than documentation:
 
-| Method | Path | Notes |
-|---|---|---|
-| POST | `/api/v1/contents` | → 201, `ETag: "1"`; duplicate slug → 409 |
-| GET | `/api/v1/contents` | limit/offset |
-| GET | `/api/v1/contents/{id}` | latest draft + publish state, `ETag` |
-| PUT | `/api/v1/contents/{id}` | `If-Match` required |
-| GET | `/api/v1/contents/{id}/versions` | history |
-| GET | `/api/v1/contents/{id}/versions/{n}` | one version |
-| POST | `/api/v1/contents/{id}/publish` | `{version: n}`, idempotent |
-| POST | `/api/v1/contents/{id}/unpublish` | |
-| POST | `/api/v1/contents/{id}/schedules` | `{version, run_at}`; past `run_at` → 400 |
-| GET | `/api/v1/contents/{id}/schedules` | |
-| DELETE | `/api/v1/schedules/{scheduleID}` | cancel |
+**Admin and public are separate chi subtrees.** The bearer-token middleware is attached inside
+the `/api/v1` group, so it covers everything below it and nothing outside it. Public routes are
+siblings, not children. That means an admin endpoint cannot lose authentication by being moved,
+and a public endpoint cannot acquire it by accident — the nesting is the policy.
 
-Public, no auth, mounted as a **separate chi subtree** so admin middleware cannot leak into it:
-`GET /public/v1/contents` · `GET /public/v1/contents/{slug}` · `GET /sitemap.xml` ·
-`GET /robots.txt` · `GET /healthz`
-
-Errors use a stable envelope: `{"error":{"code":"version_conflict","message":"...","details":{...}}}`.
+The rendered page at `GET /{slug}` is a wildcard mounted at the root, registered after every
+static route. chi resolves static segments before wildcards, so `/healthz`, `/robots.txt`,
+`/sitemap.xml`, `/api/...` and `/public/...` all still win. That precedence is relied upon, so
+it is asserted rather than assumed (`TestHTMLPage_DoesNotShadowOtherRoutes`).
 
 ---
 
-## 8. SEO
-
-- Per-version metadata: `meta_title`, `meta_description`, `canonical_url`, `og_image_url`,
-  `noindex`.
-- Slug-based canonical public URLs.
-- `GET /sitemap.xml` built from published content, with `<lastmod>` = `published_at`, honouring
-  `noindex`.
-- `GET /robots.txt`.
-- Public GETs send `ETag` and `Last-Modified`, answer `304` to `If-None-Match`, and set
-  `Cache-Control: public, max-age=60, stale-while-revalidate=300`.
-
-Crawl budget and TTFB are the parts of SEO a backend actually owns, which is why the effort went
-here rather than into rendered markup.
-
----
-
-## 9. Test plan — high-risk scenarios
+## 8. Test plan — high-risk scenarios
 
 `httptest` against a real SQLite database in `t.TempDir()`. Time is injected through
 `clock.Clock`; tests advance a `FakeClock` and assert with `require.Eventually` instead of
@@ -320,16 +305,28 @@ sleeping.
 9. `TestMigrations_UpDownUp` — migrations are reversible and re-runnable.
 10. `TestPublicETagReturns304`.
 
+Two notes on how these are written, since the technique matters as much as the coverage.
+
+**The concurrency tests use a shared start barrier.** Goroutines launched in a plain loop are
+staggered by the cost of the `go` statement itself, often enough that each finishes before the
+next begins. That turns a concurrency test into a sequential one that passes for the wrong
+reason — worse than no test, because it reads as coverage. `testutil.Concurrently` releases every
+goroutine from one `sync.WaitGroup`.
+
+**The scheduler tests use a real ticker and a fake clock.** Only *time* is faked, not the
+scheduling machinery: production polls every second, tests poll every 20ms and advance fake time
+to decide which jobs are due. Tests then wait on `require.Eventually` for a genuine tick rather
+than sleeping a guessed duration. This keeps due-times deterministic without building a virtual
+scheduler, and it means the code under test is the same code that runs in production.
+
 ---
 
-## 10. Limitations and deliberate omissions
+## 9. Further reading
 
-- **SQLite is one file on one host.** The design is correct for multiple processes on a single
-  host under WAL. SQLite is not a network database, and WAL is unsafe over NFS. The claim protocol
-  uses no SQLite-specific trick, so moving to Postgres means swapping the driver and adding
-  `FOR UPDATE SKIP LOCKED`.
-- **Clock skew** across instances is not corrected for. With a one-second poll interval, a publish
-  lands within roughly a second of `run_at`.
-- **Not implemented:** real authentication and authorization (a static bearer token only), soft
-  delete, media handling, full-text search, webhooks, rate limiting, and `Idempotency-Key` on
-  publish.
+The README is the place for everything operational — see in particular:
+
+- **Assumptions** and **Known limitations** — what is taken as given, and where the edges are.
+- **SQLite and multiple instances** — the honest account of what "multi-instance" means here, and
+  exactly what would change to move to Postgres.
+- **Exactly-once publishing** — the three mechanisms, summarised.
+- **SEO** — the rendered page, sitemap, robots, and conditional caching.
