@@ -61,8 +61,22 @@ func (s *Server) Routes() http.Handler {
 				one.Put("/", s.handleUpdateContent)
 				one.Get("/versions", s.handleListVersions)
 				one.Get("/versions/{version}", s.handleGetVersion)
+
+				one.Post("/publish", s.handlePublish)
+				one.Post("/unpublish", s.handleUnpublish)
+				one.Post("/schedules", s.handleCreateSchedule)
+				one.Get("/schedules", s.handleListSchedules)
 			})
 		})
+
+		admin.Delete("/schedules/{scheduleID}", s.handleCancelSchedule)
+	})
+
+	// Public subtree. Mounted as a sibling of /api/v1, never inside it, so no
+	// admin middleware can reach it and no public handler can see a draft.
+	r.Route("/public/v1", func(pub chi.Router) {
+		pub.Get("/contents", s.handlePublicList)
+		pub.Get("/contents/{slug}", s.handlePublicGet)
 	})
 
 	return r
