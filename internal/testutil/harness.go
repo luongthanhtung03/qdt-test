@@ -10,8 +10,10 @@ package testutil
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -25,6 +27,7 @@ import (
 	"github.com/luongthanhtung03/qdt-test/internal/clock"
 	"github.com/luongthanhtung03/qdt-test/internal/config"
 	"github.com/luongthanhtung03/qdt-test/internal/httpapi"
+	"github.com/luongthanhtung03/qdt-test/internal/scheduler"
 	"github.com/luongthanhtung03/qdt-test/internal/store"
 )
 
@@ -314,4 +317,99 @@ func (h *Harness) CountRows(query string, args ...any) int {
 	var n int
 	require.NoError(h.T, h.DB.Read.QueryRowContext(h.T.Context(), query, args...).Scan(&n))
 	return n
+}
+
+// NewWorker builds a scheduler worker against this harness's database.
+//
+// Each worker gets its own DB handle when openOwnDB is set, which is how the
+// multi-instance tests simulate separate processes contending for the same
+// SQLite file.
+func (h *Harness) NewWorker(workerID string, openOwnDB bool) *scheduler.Worker {
+	h.T.Helper()
+
+	db := h.DB
+	if openOwnDB {
+		db = OpenDB(h.T, h.DBPath)
+	}
+	return scheduler.New(db, h.Clock, scheduler.Config{
+		InstanceID:   workerID,
+		PollInterval: h.Cfg.PollInterval,
+		LeaseTTL:     h.Cfg.LeaseTTL,
+		BatchSize:    h.Cfg.BatchSize,
+		Logger:       slog.New(slog.DiscardHandler),
+	})
+}
+
+// StartWorker runs a worker in the background until the test ends, returning a
+// stop function that blocks until the worker has fully shut down (including
+// releasing its claims).
+func (h *Harness) StartWorker(workerID string, openOwnDB bool) (*scheduler.Worker, func()) {
+	h.T.Helper()
+
+	w := h.NewWorker(workerID, openOwnDB)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var done sync.WaitGroup
+	done.Add(1)
+	go func() {
+		defer done.Done()
+		w.Run(ctx)
+	}()
+
+	stopped := false
+	stop := func() {
+		if stopped {
+			return
+		}
+		stopped = true
+		cancel()
+		done.Wait()
+	}
+	h.T.Cleanup(stop)
+	return w, stop
+}
+
+// ScheduleAt schedules a version to publish at the given offset from BaseTime,
+// returning the schedule id.
+func (h *Harness) ScheduleAt(contentID string, version int64, offset time.Duration) string {
+	h.T.Helper()
+
+	resp := h.POST("/api/v1/contents/"+contentID+"/schedules", map[string]any{
+		"version": version,
+		"run_at":  BaseTime.Add(offset).Format(time.RFC3339),
+	})
+	require.Equal(h.T, http.StatusCreated, resp.Status,
+		"schedule failed: %s", string(resp.Body))
+
+	var out struct {
+		ID string `json:"id"`
+	}
+	resp.JSON(h.T, &out)
+	return out.ID
+}
+
+// ScheduleStatus reads a schedule's status straight from the database.
+func (h *Harness) ScheduleStatus(scheduleID string) string {
+	h.T.Helper()
+	var status string
+	require.NoError(h.T, h.DB.Read.QueryRowContext(h.T.Context(),
+		`SELECT status FROM publish_schedules WHERE id = ?`, scheduleID).Scan(&status))
+	return status
+}
+
+// PublicStatus returns the status code the public API gives for a slug.
+func (h *Harness) PublicStatus(slug string) int {
+	h.T.Helper()
+	return h.Do(Request{
+		Method: http.MethodGet, Path: "/public/v1/contents/" + slug, NoAuth: true,
+	}).Status
+}
+
+// WaitFor polls cond until it holds or the deadline passes.
+//
+// Used instead of a fixed sleep: the worker's ticker is real, so the test needs
+// to wait for an actual tick rather than guess how long one takes.
+func (h *Harness) WaitFor(what string, cond func() bool) {
+	h.T.Helper()
+	require.Eventually(h.T, cond, 5*time.Second, 5*time.Millisecond, what)
 }

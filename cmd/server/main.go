@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/luongthanhtung03/qdt-test/internal/clock"
 	"github.com/luongthanhtung03/qdt-test/internal/config"
 	"github.com/luongthanhtung03/qdt-test/internal/httpapi"
+	"github.com/luongthanhtung03/qdt-test/internal/scheduler"
 	"github.com/luongthanhtung03/qdt-test/internal/store"
 )
 
@@ -72,6 +74,27 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// The scheduler runs in-process. Every instance polls the same table and
+	// claims jobs with a lease, so running several against one database file
+	// is safe -- that is what makes this design portable to Postgres, where
+	// the same protocol becomes SELECT ... FOR UPDATE SKIP LOCKED.
+	var workerDone sync.WaitGroup
+	if cfg.SchedulerOn {
+		worker := scheduler.New(db, clk, scheduler.Config{
+			InstanceID:   instanceID,
+			PollInterval: cfg.PollInterval,
+			LeaseTTL:     cfg.LeaseTTL,
+			BatchSize:    cfg.BatchSize,
+		})
+		workerDone.Add(1)
+		go func() {
+			defer workerDone.Done()
+			worker.Run(ctx)
+		}()
+	} else {
+		slog.Warn("scheduler disabled; scheduled publishes will not run")
+	}
+
 	serverErr := make(chan error, 1)
 	go func() {
 		slog.Info("listening", "addr", cfg.Addr)
@@ -96,6 +119,10 @@ func run() error {
 		slog.Error("graceful shutdown timed out; forcing close", "error", err)
 		_ = srv.Close()
 	}
+
+	// Wait for the worker to finish any in-flight job and hand its claims back
+	// to the pool before the process exits.
+	workerDone.Wait()
 
 	slog.Info("stopped")
 	return nil
