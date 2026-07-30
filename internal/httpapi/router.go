@@ -9,19 +9,26 @@ import (
 
 	"github.com/luongthanhtung03/qdt-test/internal/clock"
 	"github.com/luongthanhtung03/qdt-test/internal/config"
+	"github.com/luongthanhtung03/qdt-test/internal/content"
 	"github.com/luongthanhtung03/qdt-test/internal/store"
 )
 
 // Server holds the dependencies shared by every handler.
 type Server struct {
-	DB    *store.DB
-	Cfg   config.Config
-	Clock clock.Clock
+	DB      *store.DB
+	Cfg     config.Config
+	Clock   clock.Clock
+	Content *content.Service
 }
 
 // New builds a Server.
 func New(db *store.DB, cfg config.Config, clk clock.Clock) *Server {
-	return &Server{DB: db, Cfg: cfg, Clock: clk}
+	return &Server{
+		DB:      db,
+		Cfg:     cfg,
+		Clock:   clk,
+		Content: content.New(db, clk),
+	}
 }
 
 // Routes builds the HTTP handler.
@@ -38,6 +45,25 @@ func (s *Server) Routes() http.Handler {
 	r.Use(requestLogger)
 
 	r.Get("/healthz", s.handleHealth)
+
+	// Admin subtree. The bearer-token middleware is attached inside this
+	// Route group, so it applies to everything below /api/v1 and to nothing
+	// outside it.
+	r.Route("/api/v1", func(admin chi.Router) {
+		admin.Use(requireBearerToken(s.Cfg.AdminAPIToken))
+
+		admin.Route("/contents", func(c chi.Router) {
+			c.Post("/", s.handleCreateContent)
+			c.Get("/", s.handleListContents)
+
+			c.Route("/{id}", func(one chi.Router) {
+				one.Get("/", s.handleGetContent)
+				one.Put("/", s.handleUpdateContent)
+				one.Get("/versions", s.handleListVersions)
+				one.Get("/versions/{version}", s.handleGetVersion)
+			})
+		})
+	})
 
 	return r
 }
