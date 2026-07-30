@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,10 +95,12 @@ func TestScheduledPublish_SurvivesRestart(t *testing.T) {
 	c := h.CreateContent("survives-restart", "Persisted")
 	scheduleID := h.ScheduleAt(c.ID, 1, 10*time.Minute)
 
-	// First worker runs and stops before the job is due -- the restart.
-	_, stopFirst := h.StartWorker("worker-before-restart", true)
-	h.WaitFor("first worker polls at least once", func() bool {
-		return true
+	// First worker runs and stops before the job is due -- the restart. Wait
+	// for it to have genuinely polled, so this proves the job survived a
+	// running worker rather than one that never looked.
+	first, stopFirst := h.StartWorker("worker-before-restart", true)
+	h.WaitFor("first worker completes a poll cycle", func() bool {
+		return first.Ticks() > 0
 	})
 	stopFirst()
 
@@ -402,7 +403,6 @@ func TestNoDoubleClaimUnderLoad(t *testing.T) {
 	h.Clock.Advance(2 * time.Minute)
 
 	const attempts = 20
-	var completions atomic.Int64
 
 	workers := make([]interface{ RunOnce(context.Context) }, attempts)
 	for i := range attempts {
@@ -416,5 +416,4 @@ func TestNoDoubleClaimUnderLoad(t *testing.T) {
 	events := h.CountRows(`SELECT COUNT(*) FROM publish_events WHERE schedule_id = ?`, scheduleID)
 	require.Equal(t, 1, events, "exactly one publish event under maximum contention")
 	require.Equal(t, "done", h.ScheduleStatus(scheduleID))
-	_ = completions
 }

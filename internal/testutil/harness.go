@@ -171,7 +171,10 @@ func (h *Harness) Do(req Request) *Response {
 		body = bytes.NewReader([]byte(req.Raw))
 	}
 
-	httpReq, err := http.NewRequestWithContext(h.T.Context(), req.Method, h.Server.URL+req.Path, body)
+	opCtx, cancelOp := h.opContext()
+	defer cancelOp()
+
+	httpReq, err := http.NewRequestWithContext(opCtx, req.Method, h.Server.URL+req.Path, body)
 	require.NoError(h.T, err)
 
 	if body != nil {
@@ -314,9 +317,24 @@ func Concurrently(n int, fn func(i int)) {
 // need to look past the API at what actually landed on disk.
 func (h *Harness) CountRows(query string, args ...any) int {
 	h.T.Helper()
+	ctx, cancel := h.opContext()
+	defer cancel()
+
 	var n int
-	require.NoError(h.T, h.DB.Read.QueryRowContext(h.T.Context(), query, args...).Scan(&n))
+	require.NoError(h.T, h.DB.Read.QueryRowContext(ctx, query, args...).Scan(&n))
 	return n
+}
+
+// opContext returns the context for a test-side observation.
+//
+// Deliberately not t.Context(). These helpers are called from inside
+// require.Eventually conditions, which testify evaluates on its own goroutine;
+// one of those can still be in flight when the assertion is satisfied and the
+// test moves on. Tied to the test's context, that straggler would see a
+// cancelled context and report a spurious failure. A plain timeout has no such
+// race and still cannot hang the suite.
+func (h *Harness) opContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 10*time.Second)
 }
 
 // NewWorker builds a scheduler worker against this harness's database.
@@ -391,8 +409,11 @@ func (h *Harness) ScheduleAt(contentID string, version int64, offset time.Durati
 // ScheduleStatus reads a schedule's status straight from the database.
 func (h *Harness) ScheduleStatus(scheduleID string) string {
 	h.T.Helper()
+	ctx, cancel := h.opContext()
+	defer cancel()
+
 	var status string
-	require.NoError(h.T, h.DB.Read.QueryRowContext(h.T.Context(),
+	require.NoError(h.T, h.DB.Read.QueryRowContext(ctx,
 		`SELECT status FROM publish_schedules WHERE id = ?`, scheduleID).Scan(&status))
 	return status
 }

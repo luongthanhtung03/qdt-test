@@ -79,6 +79,11 @@ func (s *Server) Routes() http.Handler {
 		pub.Get("/contents/{slug}", s.handlePublicGet)
 	})
 
+	// Crawler-facing endpoints live at the root because that is where crawlers
+	// look for them; a sitemap under a path prefix is largely ignored.
+	r.Get("/sitemap.xml", s.handleSitemap)
+	r.Get("/robots.txt", s.handleRobots)
+
 	return r
 }
 
