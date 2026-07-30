@@ -303,8 +303,9 @@ sleeping.
 
 1. `TestConcurrentUpdate_OnlyOneWins` — 20 goroutines `PUT` with the same `If-Match`: exactly one
    `200`, nineteen `412`, and `content_versions` holds exactly 2 rows.
-2. `TestScheduledPublish_ExactlyOnce_MultiWorker` — 3 workers on one database file, one due job →
-   `publish_events` count is exactly 1. The multi-instance requirement, actually tested.
+2. `TestScheduledPublish_ExactlyOnce_MultiWorker` — 5 workers, each with its own database handle,
+   on one file with one due job → `publish_events` count is exactly 1. The multi-instance
+   requirement, actually tested.
 3. `TestScheduledPublish_SurvivesRestart` — schedule, shut the worker down, open a fresh store and
    worker on the same file, advance the clock → the publish happens.
 4. `TestLeaseRecoveryAfterCrash` — worker A claims a job then dies before its transaction; after
