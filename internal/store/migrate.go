@@ -3,18 +3,32 @@ package store
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/pressly/goose/v3"
 
 	"github.com/luongthanhtung03/qdt-test/migrations"
 )
 
-// configureGoose points goose at the embedded migration files. Calling it more
-// than once is harmless, which matters because tests open many databases.
+// gooseOnce guards goose's package-level configuration.
+//
+// SetBaseFS, SetLogger and SetDialect all write globals inside goose. Migrate
+// is called once per database, and tests open many databases from parallel
+// goroutines, so calling these on every migration is a genuine data race --
+// one the race detector catches. The settings never vary, so applying them
+// exactly once is both correct and sufficient.
+var (
+	gooseOnce sync.Once
+	gooseErr  error
+)
+
 func configureGoose() error {
-	goose.SetBaseFS(migrations.FS)
-	goose.SetLogger(goose.NopLogger())
-	return goose.SetDialect("sqlite3")
+	gooseOnce.Do(func() {
+		goose.SetBaseFS(migrations.FS)
+		goose.SetLogger(goose.NopLogger())
+		gooseErr = goose.SetDialect("sqlite3")
+	})
+	return gooseErr
 }
 
 // Migrate applies all pending migrations.

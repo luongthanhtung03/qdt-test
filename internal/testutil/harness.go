@@ -34,6 +34,15 @@ import (
 // AdminToken is the bearer token every harness accepts.
 const AdminToken = "test-admin-token"
 
+// Silence request logging for the whole test binary.
+//
+// Done in init rather than per-harness because slog.SetDefault writes a global:
+// calling it from parallel tests would be the very kind of race these tests
+// exist to catch. init runs once, before any test starts.
+func init() {
+	slog.SetDefault(slog.New(slog.DiscardHandler))
+}
+
 // BaseTime is the fixed instant every fake clock starts at. A constant start
 // makes failures reproducible in a way that time.Now() would not.
 var BaseTime = time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)

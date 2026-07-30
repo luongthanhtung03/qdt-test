@@ -317,19 +317,34 @@ Concurrency tests release every goroutine from a shared barrier. Launching them 
 staggers them enough that the test can pass without ever racing — which is worse than no test,
 because it looks like coverage.
 
-### A note on `-race`
+### Running under `-race`
 
-The race detector needs `CGO_ENABLED=1` and a C compiler. The machine this was written on has
-neither, so `-race` runs in CI instead, on `ubuntu-latest`, on every push — see
-`.github/workflows/ci.yml`. CI runs the suite twice: once under `-race`, and once with
-`CGO_ENABLED=0` to prove the pure-Go path still works.
+The race detector needs `CGO_ENABLED=1` and a C compiler. If you have one:
 
-This matters less than it might seem. The scenarios above assert *outcomes* — "exactly one
-`200`", "`COUNT(*) == 1`", "never both" — and those are logic races in SQL, which the race
-detector cannot see in any case. It catches Go-level data races, which is a real but different
-category, and CI covers it.
+```bash
+make test-race
+```
 
-Locally: `make test-race` if you do have a C toolchain.
+If you do not — which was the case on the machine this was written on — any Linux container
+works:
+
+```bash
+docker run --rm -v "$PWD:/src" -w /src -e CGO_ENABLED=1 golang:1.26 \
+  go test ./... -race -count=1
+```
+
+CI runs the suite twice on every push, once under `-race` and once with `CGO_ENABLED=0` to prove
+the pure-Go path still builds and passes: `.github/workflows/ci.yml`.
+
+This was worth doing rather than waving away. The first CI run under `-race` failed, and the
+cause was real: `store.Migrate` called goose's `SetBaseFS`, `SetLogger` and `SetDialect` on every
+invocation, and those write package-level globals inside goose. Tests open a database per test
+and run in parallel, so they were racing on that configuration. The settings never vary, so a
+`sync.Once` fixes it properly.
+
+Nothing in the suite's outcome assertions would ever have caught that — it is a Go-level data
+race, not a logic race in SQL — which is precisely the argument for running the detector
+somewhere rather than reasoning that the tests look concurrent enough.
 
 ---
 
